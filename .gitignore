@@ -90,3 +90,4 @@ assets/music/
 *.log
 *.tmp
 .claude/
+CLAUDE.md
