@@ -28,10 +28,6 @@ wheels/
 *.manifest
 *.spec
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -71,23 +67,14 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
-# Game-specific ignores
-saves/*.json
-!saves/.gitkeep
-
-# Extracted assets (large files - users should extract their own)
-assets/sprites/*.png
-assets/tilesets/*.png
-assets/ui/*.png
-assets/sounds/
-assets/music/
-!assets/**/.gitkeep
-
-# Keep placeholder files
-!.gitkeep
-
 # Local development
 *.log
 *.tmp
 .claude/
 CLAUDE.md
+
+# ROM files (never commit)
+*.gba
+*.gbc
+*.gb
+*.sav

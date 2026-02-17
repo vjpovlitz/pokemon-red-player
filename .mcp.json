@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pokemon-firered": {
+      "command": "python",
+      "args": ["scripts/mcp_server.py"],
+      "type": "stdio"
+    }
+  }
+}

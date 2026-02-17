@@ -1,246 +1,134 @@
-# Pokemon Red Clone
+# Pokemon Fire Red MCP Server
 
-A faithful recreation of Pokemon Red using Python and Pygame, featuring Gen 1 battle mechanics, grid-based movement, and the classic Game Boy aesthetic.
+An MCP (Model Context Protocol) server that lets Claude Code programmatically observe and control Pokemon Fire Red running in the mGBA emulator. Read game state, press buttons, take screenshots, and automate gameplay — all through natural language.
 
-## Features
+## Architecture
 
-- **Authentic Gen 1 Mechanics**: Damage formulas, type chart, stat calculations, and catch rates match the original
-- **Stack-Based State System**: Seamless transitions between overworld, battles, menus, and dialogue
-- **Grid-Based Movement**: 16x16 pixel tiles with smooth 8-frame movement animation
-- **Full Battle System**: Turn-based combat with moves, type effectiveness, PP tracking, and AI
-- **Wild Encounters**: Random Pokemon encounters in tall grass
-- **Trainer Battles**: Line-of-sight detection and trainer AI
-- **Save System**: JSON-based save/load functionality
-
-## Requirements
-
-- Python 3.10+
-- Pygame 2.5+
-
-## Installation
-
-```bash
-# Clone or download the project
-cd C:\Users\vjpov\Codebase\Poke
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the game
-python main.py
+```
+Claude Code <--(stdio/MCP)--> mcp_server.py <--(TCP JSON)--> mgba_server.lua <--(native API)--> mGBA
 ```
 
-## Controls
+**Two-layer design:**
 
-| Action | Keys |
-|--------|------|
-| Move | Arrow Keys / WASD |
-| Confirm / Interact | Z / Enter |
-| Cancel / Run | X / Backspace |
-| Open Menu | Escape |
-| Select (Secondary) | Shift |
+1. **Lua TCP server** (`mgba_server.lua`) — Runs inside mGBA via its built-in scripting engine. Exposes raw memory read/write, button input, screenshots, and save states over a TCP socket with a newline-delimited JSON protocol on port 5555.
+
+2. **Python MCP server** (`mcp_server.py`) — Connects to the Lua server as a TCP client. Wraps raw memory access into high-level Pokemon Fire Red-specific tools and exposes them via MCP to Claude Code.
+
+## Prerequisites
+
+- **mGBA 0.10+** with scripting enabled ([download](https://mgba.io/downloads.html))
+- **Python 3.10+**
+- **Pokemon Fire Red ROM** (USA, v1.0 — game code BPRE)
+- **Claude Code** CLI
+
+## Setup
+
+### 1. Install Python dependencies
+
+```bash
+pip install -r scripts/requirements.txt
+```
+
+### 2. Load the Lua server in mGBA
+
+1. Open mGBA and load your Pokemon Fire Red ROM
+2. Go to **Tools > Scripting** (or press Ctrl+Shift+S)
+3. In the scripting window, go to **File > Load Script**
+4. Select `scripts/mgba_server.lua`
+5. You should see `mGBA TCP server listening on port 5555` in the scripting console
+
+### 3. Register the MCP server with Claude Code
+
+The project includes a `.mcp.json` file that auto-registers the server. Just restart Claude Code in this project directory and approve the MCP server when prompted.
+
+Alternatively, register manually:
+
+```bash
+claude mcp add pokemon-firered -s user -- python scripts/mcp_server.py
+```
+
+### 4. Verify the connection
+
+In Claude Code, the `pokemon-firered` MCP server should appear as connected. Try calling `get_game_state` to see your current position and party.
+
+## Available Tools (16 total)
+
+### Game State (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `get_game_state` | Full snapshot: position, party summary, badges, money |
+| `get_party` | Detailed party Pokemon info (stats, moves, EVs) |
+| `get_position` | Current map coordinates and map group/number |
+| `get_player_name` | Trainer name |
+| `get_badges` | List of earned gym badges |
+| `get_money` | Current money |
+| `get_bag` | All bag pocket contents |
+| `get_screenshot` | Current frame as base64 PNG |
+
+### Input (game control)
+
+| Tool | Description |
+|------|-------------|
+| `press_button` | Press A, B, START, SELECT, directions, L, R for N frames |
+| `press_sequence` | Press a series of buttons in order |
+| `walk` | Walk N tiles in a direction (UP/DOWN/LEFT/RIGHT) |
+
+### Emulator
+
+| Tool | Description |
+|------|-------------|
+| `save_state` | Save emulator state to slot 1-9 |
+| `load_state` | Load emulator state from slot 1-9 |
+| `run_frames` | Advance emulation by N frames (60 = ~1 second) |
+
+### Low-Level
+
+| Tool | Description |
+|------|-------------|
+| `read_memory` | Raw memory read (1/2/4/N bytes) |
+| `write_memory` | Raw memory write (1/2/4 bytes) |
 
 ## Project Structure
 
 ```
-Poke/
-├── main.py                 # Entry point
-├── config.py               # Game constants and settings
-├── requirements.txt        # Python dependencies
-│
-├── src/
-│   ├── game.py             # Main Game class, orchestrates systems
-│   │
-│   ├── core/               # Engine systems
-│   │   ├── state_manager.py    # Stack-based state machine
-│   │   ├── input_handler.py    # Keyboard input mapping
-│   │   ├── camera.py           # Viewport/scrolling
-│   │   └── animation.py        # Sprite animation
-│   │
-│   ├── states/             # Game states
-│   │   ├── title_state.py      # Title screen
-│   │   ├── overworld_state.py  # Main exploration
-│   │   ├── battle_state.py     # Pokemon battles
-│   │   └── menu_state.py       # Pause menu
-│   │
-│   ├── entities/           # Game entities
-│   │   ├── player.py           # Player character
-│   │   ├── npc.py              # NPC base class
-│   │   └── trainer.py          # Trainer NPCs
-│   │
-│   ├── world/              # Map systems
-│   │   ├── tilemap.py          # Tile rendering/collision
-│   │   ├── map_manager.py      # Map loading/switching
-│   │   └── encounter_zones.py  # Wild encounters
-│   │
-│   ├── battle/             # Battle system
-│   │   ├── battle_manager.py   # Battle coordination
-│   │   ├── damage_calc.py      # Gen 1 damage formula
-│   │   ├── type_chart.py       # Type effectiveness
-│   │   └── battle_ai.py        # Enemy AI
-│   │
-│   ├── pokemon/            # Pokemon systems
-│   │   ├── pokemon.py          # Pokemon class
-│   │   ├── stats.py            # Stat calculations
-│   │   └── party.py            # Party management
-│   │
-│   ├── ui/                 # User interface
-│   │   ├── text_box.py         # Dialogue rendering
-│   │   ├── menu.py             # Menu system
-│   │   └── health_bar.py       # HP/EXP bars
-│   │
-│   └── systems/            # Game systems
-│       ├── inventory.py        # Items/bag
-│       ├── dialogue.py         # Dialogue trees
-│       └── save_system.py      # Save/load
-│
-├── data/                   # Game data (JSON)
-│   ├── pokemon.json            # Pokemon stats
-│   ├── moves.json              # Move definitions
-│   ├── items.json              # Item definitions
-│   ├── type_chart.json         # Type effectiveness
-│   ├── wild_encounters.json    # Encounter tables
-│   └── trainers.json           # Trainer data
-│
-├── assets/
-│   ├── maps/               # Map JSON files
-│   ├── sprites/            # Character/Pokemon sprites
-│   ├── tilesets/           # Map tiles
-│   └── ui/                 # UI graphics
-│
-└── saves/                  # Save files
+scripts/
+├── mgba_server.lua       # Lua TCP server (runs inside mGBA)
+├── mcp_server.py          # FastMCP server (Claude Code entry point)
+├── mgba_client.py         # Python TCP client for the Lua server
+├── fire_red_memory.py     # Fire Red memory map + struct parsing
+└── requirements.txt       # Python dependencies (fastmcp)
+.mcp.json                  # Claude Code MCP server registration
 ```
 
-## Architecture
+## Troubleshooting
 
-### State Machine
+### "Connection refused" when calling tools
 
-The game uses a stack-based state machine allowing states to overlay each other:
+The Lua server isn't running. Make sure you:
+1. Have mGBA open with a ROM loaded
+2. Loaded `mgba_server.lua` via Tools > Scripting > File > Load Script
+3. See "Server listening on port 5555" in the scripting console
 
-```
-[OverworldState] <- Base exploration
-    └── [MenuState] <- Pause menu overlay
-        └── [BattleState] <- Battle takes over
-```
+### MCP server not showing in Claude Code
 
-States implement these methods:
-- `enter(params)` - Initialize when becoming active
-- `exit()` - Cleanup when removed
-- `pause()` / `resume()` - Handle being covered/uncovered
-- `handle_event(event)` - Process input
-- `update(dt)` - Game logic
-- `render(surface)` - Drawing
+- Restart Claude Code in the project directory
+- Check that `.mcp.json` exists in the project root
+- Try manual registration: `claude mcp add pokemon-firered -s user -- python scripts/mcp_server.py`
 
-### Pokemon System
+### Wrong memory values / garbled data
 
-Pokemon use Gen 1 formulas:
+The memory addresses are for **Pokemon Fire Red USA v1.0** only. Other versions (v1.1, European, Japanese) have different memory layouts.
 
-**Stat Calculation:**
-```
-Stat = ((Base + IV) * 2 + sqrt(EV) / 4) * Level / 100 + 5
-HP = ((Base + IV) * 2 + sqrt(EV) / 4) * Level / 100 + Level + 10
-```
+### Port 5555 already in use
 
-**Damage Formula:**
-```
-Damage = ((2*Level/5+2) * Power * Attack/Defense / 50 + 2) * Modifiers
-Modifiers = STAB(1.5) * TypeEffectiveness * Random(0.85-1.0) * Critical(2.0)
-```
+If another instance of the Lua server is running, close mGBA and reopen it. Only one instance of the server can bind to port 5555 at a time.
 
-### Map System
+## Supported Game Version
 
-Maps are JSON files compatible with Tiled editor exports:
-- Multiple tile layers
-- Collision layer (0 = walkable, 1 = solid)
-- Warp definitions for map transitions
-- NPC placements
-- Encounter zone data
+**Pokemon Fire Red (USA, v1.0)** — Game code `BPRE`, revision 0.
 
-## Configuration
-
-Edit `config.py` to adjust:
-
-```python
-# Display
-NATIVE_WIDTH = 160      # Game Boy resolution
-NATIVE_HEIGHT = 144
-SCALE = 3               # Window scaling
-
-# Gameplay
-TILE_SIZE = 16
-MOVEMENT_FRAMES = 8     # Frames to cross one tile
-FPS = 60
-```
-
-## Adding Content
-
-### New Pokemon
-
-Add to `data/pokemon.json`:
-```json
-"POKEMON_NAME": {
-  "id": 999,
-  "types": ["type1", "type2"],
-  "base_stats": {
-    "hp": 50, "attack": 50, "defense": 50,
-    "speed": 50, "special": 50
-  },
-  "exp_yield": 100,
-  "catch_rate": 45,
-  "learnset": { "1": ["tackle"] },
-  "evolution": { "into": "EVOLVED_FORM", "level": 16 }
-}
-```
-
-Also add to `src/pokemon/pokemon.py` BASE_STATS dict.
-
-### New Maps
-
-Create `assets/maps/map_name.json`:
-```json
-{
-  "name": "Map Name",
-  "width": 20,
-  "height": 18,
-  "tileset": "overworld",
-  "layers": [[[0, 0, ...]]],
-  "collision": [[0, 1, ...]],
-  "warps": [{"x": 5, "y": 0, "target_map": "other_map", "target_x": 5, "target_y": 17}],
-  "npcs": [{"name": "NPC", "x": 5, "y": 5, "dialogue": ["Hello!"]}],
-  "encounters": [{"pokemon": "RATTATA", "level_min": 2, "level_max": 5, "rate": 50}]
-}
-```
-
-### New Trainers
-
-Add to `data/trainers.json`:
-```json
-"trainer_id": {
-  "name": "JOEY",
-  "class": "Youngster",
-  "dialogue": ["Pre-battle text"],
-  "defeat_dialogue": ["After defeat text"],
-  "team": [{"species": "RATTATA", "level": 5}],
-  "prize_money": 100,
-  "sight_range": 4
-}
-```
-
-## Extracting Original Assets
-
-The game includes placeholder graphics. For authentic sprites:
-
-1. Clone the PRET pokered disassembly:
-   ```bash
-   git clone https://github.com/pret/pokered
-   ```
-
-2. Copy sprites from `pokered/gfx/`:
-   - Pokemon sprites: `gfx/pokemon/`
-   - Overworld sprites: `gfx/overworld/`
-   - Tilesets: `gfx/tilesets/`
-
-3. Place in corresponding `assets/` directories
+Memory addresses, struct layouts, and encryption keys are all specific to this version. Supporting other versions would require updating the addresses in `fire_red_memory.py`.
 
 ## License
 
