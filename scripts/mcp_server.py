@@ -9,9 +9,9 @@ Pokemon Fire Red game in mGBA.
 Architecture:
     Claude Code ←(stdio/MCP)→ this server ←(TCP JSON)→ mgba_server.lua ←(native)→ mGBA
 
-The server uses FastMCP and exposes 16 tools organized into four categories:
+The server uses FastMCP and exposes 21 tools organized into six categories:
 
-    Game State Tools:
+    Game State Tools (8):
         get_game_state   — Full snapshot (position, party, badges, money)
         get_party        — Detailed party Pokemon info (stats, moves, EVs)
         get_position     — Current map coordinates
@@ -19,19 +19,28 @@ The server uses FastMCP and exposes 16 tools organized into four categories:
         get_badges       — Earned gym badges
         get_money        — Current money
         get_bag          — All bag pocket contents
-        get_screenshot   — Current frame as base64 PNG
+        get_screenshot   — Capture frame, save to disk as labeled PNG
 
-    Input Tools:
+    Battle Tools (3):
+        get_battle_state    — Detect if in battle, get battle type/outcome
+        get_opponent_pokemon — Active opponent Pokemon stats during battle
+        get_opponent_party   — Full opponent trainer party during battle
+
+    Menu Tools (2):
+        get_start_menu_state — Read START menu cursor position and items
+        save_game            — Navigate in-game menu to save the game
+
+    Input Tools (3):
         press_button     — Press a single button for N frames
         press_sequence   — Press a series of buttons in order
         walk             — Walk N tiles in a direction
 
-    Emulator Tools:
+    Emulator Tools (3):
         save_state       — Save emulator state to a slot
         load_state       — Load emulator state from a slot
         run_frames       — Advance emulation by N frames
 
-    Low-Level Tools:
+    Low-Level Tools (2):
         read_memory      — Raw memory read (1/2/4/N bytes)
         write_memory     — Raw memory write (1/2/4 bytes)
 
@@ -57,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastmcp import FastMCP
 from mgba_client import MGBAClient
 from fire_red_memory import FireRedReader
+from save_screenshot import ScreenshotManager
 
 # Create the MCP server instance with a descriptive name
 mcp = FastMCP("pokemon-firered")
@@ -70,6 +80,9 @@ mcp = FastMCP("pokemon-firered")
 
 _client: MGBAClient | None = None
 _reader: FireRedReader | None = None
+# Screenshot manager is created once per MCP server lifetime (= one Claude Code session).
+# All screenshots within a session share the same session ID prefix.
+_screenshot_mgr: ScreenshotManager | None = None
 
 
 def _get_client() -> MGBAClient:
@@ -87,6 +100,19 @@ def _get_reader() -> FireRedReader:
     if _reader is None:
         _reader = FireRedReader(_get_client())
     return _reader
+
+
+def _get_screenshot_mgr() -> ScreenshotManager:
+    """Get or create the ScreenshotManager singleton (lazy init).
+
+    Created once per MCP server lifetime. The session ID is set at creation
+    time, so all screenshots within a Claude Code session share the same
+    session prefix for easy grouping.
+    """
+    global _screenshot_mgr
+    if _screenshot_mgr is None:
+        _screenshot_mgr = ScreenshotManager()
+    return _screenshot_mgr
 
 
 # ==========================================================================
@@ -137,10 +163,157 @@ def get_bag() -> dict:
 
 
 @mcp.tool()
-def get_screenshot() -> str:
-    """Capture the current frame as a base64-encoded PNG image. Returns a data URI string."""
+def get_screenshot(label: str = "screenshot") -> str:
+    """Capture the current frame and save it as a PNG file to screenshots/.
+
+    The saved file can be viewed natively by Claude Code using the Read tool.
+    Screenshots are named with the session ID, sequence number, and label
+    for easy identification and chronological ordering.
+
+    Args:
+        label: Descriptive label for this screenshot (e.g. "battle_start",
+               "menu_open", "route_1"). Default is "screenshot".
+
+    Returns:
+        Absolute file path to the saved PNG. Use the Read tool to view it.
+    """
     b64 = _get_client().screenshot()
-    return f"data:image/png;base64,{b64}"
+    path = _get_screenshot_mgr().save(b64, label=label)
+    return path
+
+
+# ==========================================================================
+# BATTLE TOOLS
+# ==========================================================================
+# Tools for detecting and interacting with the battle system.
+
+@mcp.tool()
+def get_battle_state() -> dict:
+    """Check if the player is currently in a battle and get battle details.
+
+    Returns battle status including:
+      - in_battle: whether a battle is active
+      - battle_type: "wild", "trainer", "double", "link", or "none"
+      - battle_outcome: result if battle has ended ("won", "lost", "ran", etc.)
+      - battlers_count: number of active combatants (2 singles, 4 doubles)
+    """
+    return _get_reader().read_battle_state()
+
+
+@mcp.tool()
+def get_opponent_pokemon() -> list[dict]:
+    """Get the opponent's active Pokemon data during a battle.
+
+    Reads from the gBattleMons array for live in-battle stats. Returns
+    the opponent's active Pokemon (slot 1) in singles, or both opponent
+    slots (1 and 3) in doubles. Only meaningful when in_battle is true.
+
+    Returns:
+        List of dicts with species, level, HP, stats, moves, and status
+        for each opponent Pokemon currently in battle.
+    """
+    battle = _get_reader().read_battle_state()
+    if not battle["in_battle"]:
+        return []
+
+    result = []
+    # In singles, opponent is slot 1. In doubles, also slot 3.
+    opponent_slots = [1]
+    if battle["battlers_count"] >= 4:
+        opponent_slots.append(3)
+
+    for slot in opponent_slots:
+        mon = _get_reader().read_battle_pokemon(slot)
+        if mon and mon["species_id"] != 0:
+            result.append(mon)
+    return result
+
+
+@mcp.tool()
+def get_opponent_party() -> list[dict]:
+    """Get the opponent trainer's full party during a trainer battle.
+
+    Reads the enemy party data area (all 6 slots). Useful for scouting
+    what Pokemon a trainer has beyond the one currently in battle.
+    Only meaningful during trainer battles.
+
+    Returns:
+        List of parsed Pokemon dicts with species, level, HP, stats, moves.
+    """
+    return _get_reader().read_opponent_party()
+
+
+# ==========================================================================
+# MENU TOOLS
+# ==========================================================================
+# Tools for reading and navigating the START menu.
+
+@mcp.tool()
+def get_start_menu_state() -> dict:
+    """Get the current START menu cursor position and displayed items.
+
+    The start menu remembers cursor position between opens. This tool
+    reads the cursor position and the displayed menu order so you know
+    exactly which option is highlighted and how to navigate to any target.
+
+    Returns:
+        Dict with cursor_pos, num_items, menu_order (list of option names
+        like "POKEDEX", "POKEMON", "BAG", etc.), and selected_item.
+    """
+    return _get_reader().read_start_menu_state()
+
+
+@mcp.tool()
+def save_game() -> str:
+    """Perform an in-game save by navigating the START menu.
+
+    This navigates the in-game menu to Save (not an emulator save state).
+    It opens the START menu, resets cursor to the top, navigates down to
+    Save, and confirms the save dialog. Takes ~5 seconds of game time.
+
+    The menu order is: Pokedex(0), Pokemon(1), Bag(2), Player(3), Save(4), Option(5), Exit(6).
+    To reliably reach Save, we reset to top first then press DOWN 4 times.
+
+    Returns:
+        Status message indicating save was initiated.
+    """
+    client = _get_client()
+
+    # Step 1: Open the START menu
+    client.press_button("START", 10)
+    client.run_frames(30)  # Wait for menu animation
+
+    # Step 2: Reset cursor to top by pressing UP enough times (max 8 items)
+    for _ in range(8):
+        client.press_button("UP", 6)
+        client.run_frames(8)
+
+    # Step 3: Navigate down to Save (index 4 in standard menu order)
+    for _ in range(4):
+        client.press_button("DOWN", 6)
+        client.run_frames(8)
+
+    # Step 4: Press A to select Save
+    client.press_button("A", 10)
+    client.run_frames(60)  # Wait for "Would you like to save?" dialog
+
+    # Step 5: Press A to confirm save
+    client.press_button("A", 10)
+    client.run_frames(120)  # Wait for save to write (~2 seconds)
+
+    # Step 6: Press A to confirm overwrite (if previous save exists)
+    client.press_button("A", 10)
+    client.run_frames(120)  # Wait for save completion
+
+    # Step 7: Press A to dismiss "saved the game" message
+    client.press_button("A", 10)
+    client.run_frames(30)
+
+    # Step 8: Press B to close any remaining menu
+    client.press_button("B", 10)
+    client.run_frames(20)
+
+    return "In-game save completed. Use get_screenshot to verify the save was successful."
 
 
 # ==========================================================================

@@ -183,6 +183,58 @@ PARTY_DATA_ADDR = 0x02024284   # Start of party Pokemon array
 PARTY_MON_SIZE = 100  # Each party Pokemon occupies exactly 100 bytes
 PARTY_MAX = 6         # Maximum party size
 
+# ---------------------------------------------------------------------------
+# Battle-related addresses (EWRAM + IWRAM)
+# ---------------------------------------------------------------------------
+# gBattleTypeFlags: 4-byte flags word, non-zero when a battle is active.
+# Bit 0 = double, bit 1 = link, bit 3 = trainer, bit 8 = wild.
+BATTLE_TYPE_FLAGS_ADDR = 0x02022B4C
+
+# gBattleOutcome: 1 byte set at end of battle.
+# 0=unresolved, 1=won, 2=lost, 3=ran, 4=caught, 5=draw, 6=opponent ran.
+BATTLE_OUTCOME_ADDR = 0x02023E8A
+
+# gBattleMons: array of 4 BattlePokemon structs (88 bytes each).
+# [0]=player slot 0, [1]=opponent slot 0, [2]=player slot 1, [3]=opponent slot 1
+BATTLE_MONS_ADDR = 0x02023BE4
+BATTLE_MON_SIZE = 88  # sizeof(struct BattlePokemon)
+
+# gBattlersCount: 1 byte — 2 for singles, 4 for doubles
+BATTLERS_COUNT_ADDR = 0x02023BCC
+
+# gActiveBattler: 1 byte — index (0-3) of currently processing battler
+ACTIVE_BATTLER_ADDR = 0x02023BC4
+
+# Enemy party data (same 100-byte Gen 3 format, 6 slots)
+ENEMY_PARTY_ADDR = 0x0202402C
+
+# gMain.callback2: pointer to the active game-loop callback.
+# During battle this points to BattleMainCB2 (0x08011101 in Thumb).
+GMAIN_CALLBACK2_ADDR = 0x030030F4
+
+# ---------------------------------------------------------------------------
+# Start menu addresses (EWRAM)
+# ---------------------------------------------------------------------------
+# sStartMenuCursorPos: 1 byte, index into the displayed menu list.
+# sStartMenuOrder: 9-byte array mapping cursor index → StartMenuOption enum.
+# To get the actual selected item: sStartMenuOrder[sStartMenuCursorPos].
+START_MENU_CURSOR_POS_ADDR = 0x020370F4
+START_MENU_NUM_ITEMS_ADDR = 0x020370F5
+START_MENU_ORDER_ADDR = 0x020370F6  # 9 bytes
+
+# StartMenuOption enum values (from pret/pokefirered src/start_menu.c)
+START_MENU_OPTIONS = {
+    0: "POKEDEX",
+    1: "POKEMON",
+    2: "BAG",
+    3: "PLAYER",     # Trainer card
+    4: "SAVE",
+    5: "OPTION",
+    6: "EXIT",
+    7: "RETIRE",     # Safari Zone only
+    8: "PLAYER2",    # Link mode variant
+}
+
 
 # ==========================================================================
 # STRING DECODING
@@ -520,6 +572,191 @@ class FireRedReader:
             pocket_addr = sb1 + bag_offset + offset
             pockets[name] = self.read_bag_pocket(pocket_addr, capacity)
         return pockets
+
+    # -- Battle state --
+
+    def read_battle_state(self) -> dict[str, Any]:
+        """Read the current battle state from memory.
+
+        Returns a dict with:
+          - in_battle: bool — whether a battle is currently active
+          - battle_type: str — "wild", "trainer", "double", "link", or "none"
+          - battle_outcome: str — "unresolved", "won", "lost", "ran", etc.
+          - battlers_count: int — number of active battlers (2 singles, 4 doubles)
+
+        The primary detection is gBattleTypeFlags (0x02022B4C) — non-zero
+        means a battle is in progress. The individual bits encode the type.
+        """
+        flags = self.client.read32(BATTLE_TYPE_FLAGS_ADDR)
+        outcome_byte = self.client.read8(BATTLE_OUTCOME_ADDR)
+
+        # Determine battle type from flags
+        in_battle = flags != 0
+        if not in_battle:
+            battle_type = "none"
+        elif flags & (1 << 0):
+            battle_type = "double"
+        elif flags & (1 << 1):
+            battle_type = "link"
+        elif flags & (1 << 3):
+            battle_type = "trainer"
+        elif flags & (1 << 8):
+            battle_type = "wild"
+        else:
+            battle_type = "unknown"
+
+        # Map outcome byte to human-readable string
+        outcome_map = {
+            0: "unresolved", 1: "won", 2: "lost",
+            3: "ran", 4: "caught", 5: "draw", 6: "opponent_ran",
+        }
+        outcome = outcome_map.get(outcome_byte, f"unknown({outcome_byte})")
+
+        battlers_count = self.client.read8(BATTLERS_COUNT_ADDR) if in_battle else 0
+
+        return {
+            "in_battle": in_battle,
+            "battle_type": battle_type,
+            "battle_type_flags": flags,
+            "battle_outcome": outcome,
+            "battlers_count": battlers_count,
+        }
+
+    def read_battle_pokemon(self, battler_index: int) -> dict[str, Any] | None:
+        """Read a BattlePokemon struct from the gBattleMons array.
+
+        The in-battle struct is 88 bytes with a different layout from the
+        100-byte party struct. It contains live battle stats (including
+        stat stages, status, and current HP) but is NOT encrypted.
+
+        Args:
+            battler_index: 0=player slot 0, 1=opponent slot 0,
+                          2=player slot 1 (doubles), 3=opponent slot 1.
+
+        Returns:
+            Dict with species, level, HP, stats, moves, and status.
+            None if the read fails or data is empty.
+        """
+        addr = BATTLE_MONS_ADDR + battler_index * BATTLE_MON_SIZE
+        data = self.client.read_range(addr, BATTLE_MON_SIZE)
+
+        if len(data) < BATTLE_MON_SIZE:
+            return None
+
+        # BattlePokemon struct layout (from pret/pokefirered include/pokemon.h):
+        # Offsets are from the struct's pokefirered decomp:
+        #   u16 species          @ 0x00
+        #   u16 attack           @ 0x02
+        #   u16 defense          @ 0x04
+        #   u16 speed            @ 0x06
+        #   u16 spAttack         @ 0x08
+        #   u16 spDefense        @ 0x0A
+        #   u16 moves[4]         @ 0x0C-0x13
+        #   u32 pp[4] (packed)   @ 0x14-0x17 (1 byte each)
+        #   ...
+        #   u16 hp               @ 0x28
+        #   u8  level            @ 0x2A
+        #   ...
+        #   u16 maxHP            @ 0x2C
+        #   ...
+        #   u32 status1          @ 0x4C  (primary status: burn, poison, etc.)
+        #   u32 status2          @ 0x50  (volatile: confused, flinch, etc.)
+
+        species = struct.unpack_from("<H", data, 0x00)[0]
+        attack = struct.unpack_from("<H", data, 0x02)[0]
+        defense = struct.unpack_from("<H", data, 0x04)[0]
+        speed = struct.unpack_from("<H", data, 0x06)[0]
+        sp_attack = struct.unpack_from("<H", data, 0x08)[0]
+        sp_defense = struct.unpack_from("<H", data, 0x0A)[0]
+
+        # 4 move IDs (2 bytes each)
+        moves = []
+        for i in range(4):
+            move_id = struct.unpack_from("<H", data, 0x0C + i * 2)[0]
+            if move_id != 0:
+                moves.append({"id": move_id, "pp": data[0x14 + i]})
+
+        hp = struct.unpack_from("<H", data, 0x28)[0]
+        level = data[0x2A]
+        max_hp = struct.unpack_from("<H", data, 0x2C)[0]
+
+        status1 = struct.unpack_from("<I", data, 0x4C)[0]
+        status2 = struct.unpack_from("<I", data, 0x50)[0]
+
+        species_name = SPECIES_NAMES.get(species, f"Pokemon #{species}")
+
+        return {
+            "species_id": species,
+            "species_name": species_name,
+            "level": level,
+            "hp": hp,
+            "max_hp": max_hp,
+            "attack": attack,
+            "defense": defense,
+            "speed": speed,
+            "sp_attack": sp_attack,
+            "sp_defense": sp_defense,
+            "moves": moves,
+            "status1": status1,
+            "status2": status2,
+        }
+
+    def read_opponent_party(self) -> list[dict[str, Any]]:
+        """Read the enemy trainer's full party during a battle.
+
+        Uses the enemy party data area (same 100-byte encrypted format as
+        the player's party). Only meaningful during trainer battles.
+
+        Returns:
+            List of parsed Pokemon dicts (same format as read_party).
+        """
+        # Enemy party count is at ENEMY_PARTY_ADDR - 3 (mirroring player layout)
+        # But we can also just read all 6 slots and skip empty ones
+        party = []
+        for i in range(PARTY_MAX):
+            addr = ENEMY_PARTY_ADDR + i * PARTY_MON_SIZE
+            data = self.client.read_range(addr, PARTY_MON_SIZE)
+            mon = parse_party_pokemon(data)
+            if mon and mon["species_id"] != 0:
+                party.append(mon)
+        return party
+
+    # -- Start menu --
+
+    def read_start_menu_state(self) -> dict[str, Any]:
+        """Read the current START menu cursor position and displayed items.
+
+        The start menu uses two-level indirection:
+          - sStartMenuCursorPos is the cursor index into the display list
+          - sStartMenuOrder maps display positions to StartMenuOption enum values
+
+        Returns:
+            Dict with cursor_pos, num_items, menu_order (list of option names),
+            and selected_item (the option name the cursor is currently on).
+        """
+        cursor_pos = self.client.read8(START_MENU_CURSOR_POS_ADDR)
+        num_items = self.client.read8(START_MENU_NUM_ITEMS_ADDR)
+
+        # Read the order array (up to 9 bytes, but only num_items are valid)
+        order_data = self.client.read_range(START_MENU_ORDER_ADDR, 9)
+
+        # Build the display list of option names
+        menu_order = []
+        for i in range(min(num_items, 9)):
+            option_id = order_data[i]
+            menu_order.append(START_MENU_OPTIONS.get(option_id, f"unknown({option_id})"))
+
+        # What option is the cursor currently on?
+        selected_item = "unknown"
+        if cursor_pos < len(menu_order):
+            selected_item = menu_order[cursor_pos]
+
+        return {
+            "cursor_pos": cursor_pos,
+            "num_items": num_items,
+            "menu_order": menu_order,
+            "selected_item": selected_item,
+        }
 
     # -- Combined snapshot --
 
